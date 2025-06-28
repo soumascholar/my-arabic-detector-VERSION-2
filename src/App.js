@@ -248,7 +248,9 @@ export default function App() {
         </div>
       </main>
 
-      <style>{`
-        @import url('https://f
+    <style>{`
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Naskh+Arabic:wght@400;700&family=Inter:wght@400;500;700&display=swap');
+  body { font-family: 'Inter', sans-serif; }
+`}</style>
 
 
