@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore, collection, addDoc, query, onSnapshot, serverTimestamp, doc, getDoc, updateDoc, deleteDoc } from 'firebase/firestore';
-import { Upload, FileScan, History, Loader2, AlertTriangle, Image as ImageIcon } from 'lucide-react';
+import { Upload, History, Loader2, Image as ImageIcon } from 'lucide-react';
 
 // --- Firebase Config ---
 const firebaseConfig = {
