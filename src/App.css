@@ -36,3 +36,16 @@
     transform: rotate(360deg);
   }
 }
+.admin-correction {
+  border-left: 3px solid #3b82f6;
+  background: #f3f4f6;
+  padding: 0.5rem;
+  border-radius: 0.5rem;
+  margin-top: 0.5rem;
+}
+@media (max-width: 600px) {
+  .admin-correction {
+    border-left: none;
+    border-top: 3px solid #3b82f6;
+  }
+}

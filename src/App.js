@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, addDoc, query, onSnapshot, serverTimestamp } from 'firebase/firestore';
+import { getFirestore, collection, addDoc, query, onSnapshot, serverTimestamp, doc, getDoc, updateDoc, deleteDoc } from 'firebase/firestore';
 import { Upload, FileScan, History, Loader2, AlertTriangle, Image as ImageIcon } from 'lucide-react';
 
-// --- Firebase Configuration ---
+// --- Firebase Config ---
 const firebaseConfig = {
   apiKey: "AIzaSyCeafx8n1lOqyPINvQH5vDt1vD9Oh7diOU",
   authDomain: "souma-s.firebaseapp.com",
@@ -15,57 +15,64 @@ const firebaseConfig = {
 };
 
 export default function App() {
-  // --- State Management ---
   const [imageFile, setImageFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
   const [detectedText, setDetectedText] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
   const [history, setHistory] = useState([]);
+  const [corrections, setCorrections] = useState({});
+  const [savedStates, setSavedStates] = useState({});
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [db, setDb] = useState(null);
   const [userId, setUserId] = useState(null);
-  const [isAuthReady, setIsAuthReady] = useState(false);
   const hasAttemptedAuthRef = useRef(false);
 
-  // --- Firebase Initialization and Authentication ---
-  useEffect(() => {
+  // 🗑️ Delete function
+  const handleDelete = async (id) => {
+    if (!db || !userId) return;
     try {
-      const app = initializeApp(firebaseConfig);
-      const firestoreDb = getFirestore(app);
-      const firebaseAuth = getAuth(app);
-      setDb(firestoreDb);
-
-      const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
-        if (user) {
-          setUserId(user.uid);
-          setIsAuthReady(true);
-        } else if (!hasAttemptedAuthRef.current) {
-          hasAttemptedAuthRef.current = true;
-          try {
-            await signInAnonymously(firebaseAuth);
-          } catch (authError) {
-            console.error("Anonymous sign-in error:", authError);
-            setError("Could not authenticate. History may not be saved.");
-          }
-          setIsAuthReady(true);
-        }
-      });
-
-      return () => unsubscribe();
-    } catch (e) {
-      console.error("Firebase initialization failed:", e);
-      setError("Could not connect to the database. History is disabled.");
-      setIsAuthReady(true);
+      await deleteDoc(doc(db, `detections/${userId}/items`, id));
+    } catch (err) {
+      console.error("Delete error:", err);
     }
+  };
+
+  // Firebase init + auth
+  useEffect(() => {
+    const app = initializeApp(firebaseConfig);
+    const firestoreDb = getFirestore(app);
+    const firebaseAuth = getAuth(app);
+    setDb(firestoreDb);
+
+    const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+      if (user) {
+        setUserId(user.uid);
+        window.currentUserId = user.uid;
+        setIsAuthReady(true);
+        const adminDoc = await getDoc(doc(firestoreDb, 'admin_users', user.uid));
+        setIsAdmin(adminDoc.exists());
+        window.isAdmin = adminDoc.exists();
+        console.log("Am I admin?", adminDoc.exists());
+      } else if (!hasAttemptedAuthRef.current) {
+        hasAttemptedAuthRef.current = true;
+        try {
+          await signInAnonymously(firebaseAuth);
+        } catch (authError) {
+          console.error("Anonymous sign-in error:", authError);
+        }
+        setIsAuthReady(true);
+      }
+    });
+    return () => unsubscribe();
   }, []);
 
-  // --- Firestore History Listener ---
+  // Firestore listener
   useEffect(() => {
     if (!isAuthReady || !db || !userId) return;
 
-    const historyCollectionPath = `detections/${userId}/items`;
-    const q = query(collection(db, historyCollectionPath));
-
+    const q = query(collection(db, `detections/${userId}/items`));
     const unsubscribe = onSnapshot(q, (querySnapshot) => {
       const historyData = [];
       querySnapshot.forEach((doc) => {
@@ -75,23 +82,25 @@ export default function App() {
       });
       historyData.sort((a, b) => b.timestamp - a.timestamp);
       setHistory(historyData);
-    }, (err) => {
-      console.error("Error fetching history:", err);
-      setError("Could not load detection history. Check Firestore security rules.");
-    });
 
+      const initial = {};
+      historyData.forEach(item => {
+        initial[item.id] = item.correctedText || item.text;
+      });
+      setCorrections(initial);
+    });
     return () => unsubscribe();
   }, [isAuthReady, db, userId]);
 
-  // --- Helpers ---
-  const toBase64 = (file) => new Promise((resolve, reject) => {
+  // Helpers
+  const toBase64 = (file) => new Promise((res, rej) => {
     const reader = new FileReader();
     reader.readAsDataURL(file);
-    reader.onload = () => resolve(reader.result.split(',')[1]);
-    reader.onerror = reject;
+    reader.onload = () => res(reader.result.split(',')[1]);
+    reader.onerror = rej;
   });
 
-  // --- Event Handlers ---
+  // Events
   const handleImageChange = (e) => {
     const file = e.target.files[0];
     if (file) {
@@ -103,158 +112,182 @@ export default function App() {
   };
 
   const handleDetectText = async () => {
-    if (!imageFile) {
-      setError('Please upload an image first.');
-      return;
-    }
-
-    const apiKey = process.env.REACT_APP_GEMINI_API_KEY;
-    if (!apiKey) {
-      setError("Gemini API key is not configured. Please set it in your .env file.");
-      return;
-    }
-
+    if (!imageFile) return setError('Please upload an image first.');
     setIsLoading(true);
     setError('');
-    setDetectedText('');
-
+    const apiKey = process.env.REACT_APP_GEMINI_API_KEY;
     try {
-      const base64ImageData = await toBase64(imageFile);
+      const base64 = await toBase64(imageFile);
+      const prompt = `
+You are a world-class expert in historical Arabic epigraphy and paleography.
+Your task is to meticulously analyze the provided image of a historical object (coin, manuscript, stucco, tile, etc.) and transcribe ONLY the Arabic script visible.
 
-      const prompt = `You are a world-class expert in historical Arabic epigraphy and paleography. Your task is to meticulously analyze the provided image of a historical object (stucco, coin, manuscript, tile, etc.) and transcribe ONLY the Arabic script visible.
-- Provide a clear transcription of the Arabic text.
-- If parts of the text are illegible, use [...] to indicate the missing or unreadable section.
-- Do not describe the object itself or provide historical context unless it is part of the script.
-- If no Arabic text is discernible in the image, respond with "No clear Arabic text detected.".`
+- If the text is clearly organized into fields (e.g., outer ring, central field, margin), transcribe them separately.
+- If parts of the text are illegible, use [...] to indicate missing sections.
+- After transcription, provide a concise English translation for each field.
+- Do NOT add historical commentary, calligraphy style, artistic analysis, or speculative guesses about the object.
+- If no Arabic text is discernible, respond with: "No clear Arabic text detected."
 
-      const payload = {
-        contents: [
-          {
-            role: "user",
-            parts: [
-              { text: prompt },
-              { inlineData: { mimeType: imageFile.type, data: base64ImageData } }
-            ]
-          }
-        ],
-      };
+✅ Output format:
+On coins (for example):
+Outer ring: "..."
+Central field: "..."
+Translation:
+Outer ring: "..."
+Central field: "..."
 
-      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
+Or, if only one block:
+Text: "..."
+Translation: "..."
 
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new Error(`API request failed with status ${response.status}: ${errorBody}`);
-      }
+On a stucco band:
+Text: "..."
+Translation: "..."
 
+On a manuscript margin:
+Margin text: "..."
+Translation: "..."`;
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: prompt }, { inlineData: { mimeType: imageFile.type, data: base64 } }] }]
+          })
+        }
+      );
       const result = await response.json();
-      let transcription = "Could not extract text. The model's response was empty.";
-      if (result.candidates?.[0]?.content?.parts?.[0]?.text) {
-        transcription = result.candidates[0].content.parts[0].text;
-      } else if (result.promptFeedback?.blockReason) {
-        transcription = `Detection blocked. Reason: ${result.promptFeedback.blockReason}`;
-      }
-
-      setDetectedText(transcription);
+      const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "No text detected.";
+      setDetectedText(text);
 
       if (db && userId) {
-        const historyCollectionPath = `detections/${userId}/items`;
-        await addDoc(collection(db, historyCollectionPath), {
-          text: transcription,
+        await addDoc(collection(db, `detections/${userId}/items`), {
+          text,
           imageName: imageFile.name,
           createdAt: serverTimestamp(),
         });
       }
     } catch (err) {
-      console.error("Detection error:", err);
-      setError(`An error occurred during detection: ${err.message}. Please try again.`);
+      console.error(err);
+      setError("Error: " + err.message);
     } finally {
       setIsLoading(false);
     }
   };
 
-  // --- UI ---
+  // UI
   return (
-    <div className="bg-gray-900 text-gray-100 min-h-screen flex flex-col p-4 md:p-6 lg:p-8">
-      <header className="text-center mb-8">
-        <h1 className="text-4xl md:text-5xl font-bold text-teal-400">Historical Arabic Text Detector</h1>
-        <p className="text-lg text-gray-400 mt-2">Upload an image of a historical artifact to extract Arabic script.</p>
-      </header>
+    <>
+      <h1 className="text-red-500 text-3xl">Tailwind works!</h1>
+      <div className="bg-gray-900 text-gray-100 min-h-screen p-4">
+        <header className="text-center mb-8">
+          <h1 className="text-4xl font-bold text-teal-400">Historical Arabic Text Detector</h1>
+          <p className="text-lg text-gray-400">
+            Upload an image of a historical artifact to extract Arabic script.
+          </p>
+        </header>
 
-      <main className="flex-grow grid grid-cols-1 lg:grid-cols-12 gap-8">
-        {/* Left panel */}
-        <div className="lg:col-span-5 flex flex-col bg-gray-800/50 p-6 rounded-2xl shadow-lg border border-gray-700">
-          <h2 className="text-2xl font-semibold text-teal-300 mb-4 flex items-center">
-            <Upload className="mr-3" />1. Upload Image
-          </h2>
-          <label htmlFor="file-upload" className="flex-grow flex flex-col justify-center items-center w-full border-2 border-dashed border-gray-600 rounded-xl p-6 cursor-pointer hover:border-teal-500 hover:bg-gray-800 transition-colors">
-            {previewUrl ? (
-              <img src={previewUrl} alt="Preview" className="max-h-64 w-auto object-contain rounded-lg shadow-md" />
-            ) : (
-              <div className="text-center text-gray-400">
-                <ImageIcon className="mx-auto h-12 w-12" />
-                <span className="mt-2 block font-semibold">Click to upload or drag & drop</span>
-                <span className="mt-1 block text-sm">PNG, JPG, WEBP</span>
-              </div>
-            )}
-          </label>
-          <input id="file-upload" type="file" className="hidden" accept="image/png, image/jpeg, image/webp" onChange={handleImageChange} />
-          <button onClick={handleDetectText} disabled={!imageFile || isLoading} className="mt-6 w-full flex items-center justify-center bg-teal-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-teal-500 disabled:bg-gray-500 disabled:cursor-not-allowed">
-            {isLoading ? (<><Loader2 className="animate-spin mr-3" />Detecting...</>) : (<><FileScan className="mr-3" />Detect Arabic Text</>)}
-          </button>
-        </div>
-
-        {/* Right panel */}
-        <div className="lg:col-span-7 flex flex-col gap-8">
-          <div className="bg-gray-800/50 p-6 rounded-2xl shadow-lg border border-gray-700 flex flex-col flex-1">
-            <h2 className="text-2xl font-semibold text-teal-300 mb-4">2. Transcription Results</h2>
-            <div className="bg-gray-900 flex-grow rounded-lg p-4 text-lg whitespace-pre-wrap overflow-y-auto" style={{ fontFamily: "'Noto Naskh Arabic', serif" }}>
-              {isLoading && <p className="text-gray-400">Analyzing image...</p>}
-              {error && (
-                <div className="text-red-400 flex items-center">
-                  <AlertTriangle className="mr-2 h-5 w-5" />
-                  <div>
-                    <p className="font-semibold">Error</p>
-                    <p className="text-sm">{error}</p>
-                  </div>
+        <main className="grid lg:grid-cols-12 gap-8">
+          {/* Upload panel */}
+          <div className="lg:col-span-5 bg-gray-800/50 p-6 rounded-2xl">
+            <h2 className="text-2xl font-semibold text-teal-300 mb-4 flex items-center">
+              <Upload className="mr-3" />1. Upload Image
+            </h2>
+            <label
+              htmlFor="file-upload"
+              className="border-2 border-dashed border-gray-600 rounded-xl p-6 cursor-pointer hover:border-teal-500"
+            >
+              {previewUrl ? (
+                <img src={previewUrl} alt="Preview" className="max-h-64 w-auto" />
+              ) : (
+                <div className="text-gray-400 text-center">
+                  <ImageIcon className="mx-auto h-12 w-12" />
+                  <span>Click to upload or drag & drop</span>
                 </div>
               )}
-              {!isLoading && !error && !detectedText && <p className="text-gray-500">Detected text will appear here.</p>}
-              {detectedText}
-            </div>
+            </label>
+            <input id="file-upload" type="file" className="hidden" onChange={handleImageChange} />
+            <button
+              onClick={handleDetectText}
+              disabled={!imageFile || isLoading}
+              className="mt-4 bg-teal-600 w-full py-2 rounded"
+            >
+              {isLoading ? <Loader2 className="animate-spin mx-auto" /> : "Detect Arabic Text"}
+            </button>
           </div>
 
-          <div className="bg-gray-800/50 p-6 rounded-2xl shadow-lg border border-gray-700 flex flex-col flex-1">
-            <h2 className="text-2xl font-semibold text-teal-300 mb-4 flex items-center"><History className="mr-3" />Detection History</h2>
-            <div className="flex-grow space-y-3 pr-2 overflow-y-auto">
-              {isAuthReady && history.length > 0 ? (
-                history.map(item => (
-                  <div key={item.id} className="bg-gray-700/50 p-3 rounded-lg border-l-4 border-teal-500">
-                    <p className="font-mono text-xs text-gray-400 mb-1">{item.imageName || 'Untitled'} - {item.timestamp.toLocaleDateString()}</p>
-                    <p className="text-gray-200 text-sm whitespace-pre-wrap" style={{ fontFamily: "'Noto Naskh Arabic', serif" }}>{item.text}</p>
-                  </div>
-                ))
-              ) : (
-                <p className="text-gray-500 h-full flex items-center justify-center">
-                  {isAuthReady ? "No history yet. Detections will be saved here." : "Connecting to history..."}
-                </p>
-              )}
+          {/* Results & History */}
+          <div className="lg:col-span-7 flex flex-col gap-8">
+            <div className="bg-gray-800/50 p-6 rounded-2xl">
+              <h2 className="text-2xl font-semibold text-teal-300 mb-4">2. Transcription Results</h2>
+              <div className="bg-gray-900 p-4 rounded">
+                {error ? (
+                  <p className="text-red-400">{error}</p>
+                ) : (
+                  detectedText || <p className="text-gray-500">Detected text will appear here.</p>
+                )}
+              </div>
+            </div>
+
+            <div className="bg-gray-800/50 p-6 rounded-2xl">
+              <h2 className="text-2xl font-semibold text-teal-300 mb-4 flex items-center">
+                <History className="mr-3" />Detection History
+              </h2>
+              <div className="space-y-3">
+                {isAuthReady && history.length > 0 ? (
+                  history.map(item => (
+                    <div key={item.id} className="bg-gray-700/50 p-3 rounded-lg">
+                      <p className="text-xs text-gray-400">
+                        {item.imageName} - {item.timestamp.toLocaleDateString()}
+                      </p>
+                      <p className="text-gray-200 whitespace-pre-wrap">
+                        {item.correctedText || item.text}
+                      </p>
+                      {isAdmin && (
+                        <div className="mt-2 flex flex-col">
+                          <textarea
+                            className="w-full p-2 rounded text-black"
+                            value={corrections[item.id] || ''}
+                            onChange={e =>
+                              setCorrections(prev => ({ ...prev, [item.id]: e.target.value }))
+                            }
+                          />
+                          <div className="flex gap-2 mt-1">
+                            <button
+                              onClick={async () => {
+                                await updateDoc(doc(db, `detections/${userId}/items`, item.id), {
+                                  correctedText: corrections[item.id],
+                                  isCorrected: true,
+                                  correctedAt: serverTimestamp()
+                                });
+                                setSavedStates(prev => ({ ...prev, [item.id]: true }));
+                              }}
+                              disabled={savedStates[item.id]}
+                              className="px-3 py-1 bg-blue-600 text-white rounded"
+                            >
+                              {savedStates[item.id] ? '✓ Saved' : 'Save Correction'}
+                            </button>
+
+                            <button
+                              onClick={() => handleDelete(item.id)}
+                              className="px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ))
+                ) : (
+                  <p className="text-gray-500">No history yet.</p>
+                )}
+              </div>
             </div>
           </div>
-        </div>
-      </main>
-
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Noto+Naskh+Arabic:wght@400;700&family=Inter:wght@400;500;700&display=swap');
-        body { font-family: 'Inter', sans-serif; }
-      `}</style>
-    </div>
+        </main>
+      </div>
+    </>
   );
 }
-
-
-
